@@ -1,0 +1,4 @@
+bleak>=0.20.2
+asyncio>=3.4.3
+transformers>=4.30.0
+torch>=2.0.0

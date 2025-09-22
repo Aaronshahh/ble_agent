@@ -8,15 +8,24 @@ import asyncio
 import json
 import uuid
 import platform
-from typing import Dict, Callable, Any, Optional, List, Tuple
+import logging
+from typing import Dict, Callable, Any, Optional, List, Tuple, Set
 
 from bleak import BleakScanner, BleakClient, BleakGATTCharacteristic, BleakServer
 from bleak.backends.device import BLEDevice
 from bleak.backends.scanner import AdvertisementData
 
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # BLE Service and Characteristic UUIDs
 SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
 MESSAGE_CHAR_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb"
+
+# Global BLE server instance for this process
+_ble_server = None
+_ble_server_clients = set()
 
 class BLEMesh:
     """
@@ -30,22 +39,51 @@ class BLEMesh:
         Args:
             agent_id: Unique identifier for this agent in the mesh
         """
+        global _ble_server, _ble_server_clients
+        
         self.agent_id = agent_id
         self.callbacks: Dict[str, Callable[[str, dict], None]] = {}
         self.connected_devices: Dict[str, BleakClient] = {}
         self.is_advertising = False
         self.message_queue = asyncio.Queue()
         self.scanning = False
+        self._local_agents: Dict[str, Callable[[str, dict], None]] = {}
         
         # Generate a unique local name for BLE advertisement
         self.local_name = f"AgentMesh-{agent_id}"
         
+        # Initialize the shared BLE server if it doesn't exist
+        if _ble_server is None:
+            _ble_server = self._create_ble_server()
+        self.ble_server = _ble_server
+        _ble_server_clients.add(self)
+        
     async def start(self) -> None:
         """Start the BLE mesh network."""
+        # Register with the shared BLE server
+        if hasattr(self, 'ble_server'):
+            await self._register_local_agent()
+        
         # Start advertising and scanning in the background
         asyncio.create_task(self._advertise())
         asyncio.create_task(self._scan_for_peers())
         asyncio.create_task(self._process_message_queue())
+    
+    async def _register_local_agent(self):
+        """Register this agent with other local agents."""
+        global _ble_server_clients
+        for client in _ble_server_clients:
+            if client != self:
+                self._local_agents[client.agent_id] = client._handle_incoming_message
+                client._local_agents[self.agent_id] = self._handle_incoming_message
+    
+    async def _handle_incoming_message(self, sender_id: str, message: dict) -> None:
+        """Handle incoming messages from local agents."""
+        if 'type' in message and message['type'] in self.callbacks:
+            try:
+                await self.callbacks[message['type']](sender_id, message['data'])
+            except Exception as e:
+                print(f"[BLE] Error in local message handler: {e}")
     
     async def stop(self) -> None:
         """Stop the BLE mesh network."""
@@ -76,7 +114,16 @@ class BLEMesh:
             target_id: ID of the target agent
             message: Message data to send (must be JSON serializable)
         """
-        # Add metadata to the message
+        # Check if the target is a local agent
+        if target_id in self._local_agents:
+            # Route locally
+            try:
+                await self._local_agents[target_id](self.agent_id, message)
+                return
+            except Exception as e:
+                print(f"[BLE] Error sending to local agent {target_id}: {e}")
+        
+        # For remote agents, use BLE
         message_with_meta = {
             "sender": self.agent_id,
             "recipient": target_id,
@@ -115,63 +162,86 @@ class BLEMesh:
                 else:
                     print(f"[BLE] Could not connect to {target_id}")
     
+    def _create_ble_server(self) -> 'BLEMesh':
+        """Create a shared BLE server for all agents on this device."""
+        server = BleakServer("AgentMesh-Host")
+        
+        # Add our service and characteristic
+        asyncio.create_task(server.add_service(
+            SERVICE_UUID,
+            [
+                {
+                    "uuid": MESSAGE_CHAR_UUID,
+                    "properties": ["read", "write", "notify"],
+                    "value": None,
+                }
+            ]
+        ))
+        
+        # Start the server
+        asyncio.create_task(server.start())
+        print(f"[BLE] Shared BLE server started")
+        return server
+    
     async def _advertise(self) -> None:
         """Advertise this device's presence on the BLE network."""
         self.is_advertising = True
-        print(f"[BLE] Advertising as {self.local_name}")
+        print(f"[BLE] Agent {self.agent_id} is active")
         
-        # On Windows, we need to create a BLE server to be discoverable
-        async with BleakServer(self.local_name) as server:
-            # Add our service and characteristic
-            await server.add_service(
-                SERVICE_UUID,
-                [
-                    {
-                        "uuid": MESSAGE_CHAR_UUID,
-                        "properties": ["read", "write", "notify"],
-                        "value": None,
-                    }
-                ]
-            )
-            
-            # Start advertising
-            await server.start()
-            print(f"[BLE] BLE server started and advertising")
-            
-            # Keep the server running
-            while self.is_advertising:
-                await asyncio.sleep(1)
+        # Keep the agent running
+        while self.is_advertising:
+            await asyncio.sleep(1)
     
     async def _scan_for_peers(self) -> None:
         """Scan for other BLE mesh devices."""
         self.scanning = True
         print("[BLE] Starting device scan...")
         
-        # Windows-specific BLE scan settings
-        scanner = BleakScanner(
-            detection_callback=self._detection_callback,
-            service_uuids=[SERVICE_UUID],
-            scanning_mode="active"
-        )
-        
-        try:
-            async with scanner:
-                while self.scanning:
+        while self.scanning:
+            try:
+                # Windows-specific BLE scan settings
+                scanner = BleakScanner(
+                    detection_callback=self._detection_callback,
+                    service_uuids=[SERVICE_UUID],
+                    scanning_mode="active"
+                )
+                
+                async with scanner:
                     print("[BLE] Scanning for peers...")
-                    await asyncio.sleep(10.0)  # Scan for 10 seconds
-        except Exception as e:
-            print(f"[BLE] Error in scanner: {e}")
-            self.scanning = False
+                    await asyncio.sleep(5.0)  # Scan for 5 seconds
+                    
+            except Exception as e:
+                print(f"[BLE] Error in scanner: {e}")
+                await asyncio.sleep(1)  # Wait before retrying
     
     def _detection_callback(self, device, advertisement_data):
         """Handle discovered BLE devices."""
         try:
-            if device.name and device.name.startswith("AgentMesh-"):
+            if not device or not device.name:
+                return
+                
+            # Skip if this is our own advertisement
+            if device.name == self.local_name:
+                return
+                
+            if device.name.startswith("AgentMesh-"):
                 peer_id = device.name.split("-", 1)[1]
-                if peer_id != self.agent_id and peer_id not in self.connected_devices:
-                    print(f"[BLE] Found peer: {peer_id} at {device.address}")
-                    # Schedule connection in the event loop
+                
+                # Skip if we're already connected or this is us
+                if peer_id == self.agent_id or peer_id in self.connected_devices:
+                    return
+                
+                # Skip if this is a local agent
+                if peer_id in self._local_agents:
+                    return
+                    
+                print(f"[BLE] Found remote peer: {peer_id} at {device.address}")
+                
+                # Only connect if we have an active message for this peer
+                # This prevents unnecessary connections
+                if any(target == peer_id for target, _ in self.message_queue._queue):
                     asyncio.create_task(self._connect_to_peer(peer_id, device.address))
+                    
         except Exception as e:
             print(f"[BLE] Error in detection callback: {e}")
     

@@ -1,53 +1,58 @@
 """
-AI Agent implementation for the Bluetooth Mesh Network simulation.
+AI Agent implementation for BLE communication.
 
 This module defines the Agent class which can send and receive messages
-and generate responses using a HuggingFace language model.
+over BLE and generate responses using a language model.
 """
 import asyncio
-from typing import Dict, Any, Optional
+import json
+import logging
+from typing import Dict, Any, Optional, Callable
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Import the transformers library for AI capabilities
 try:
     from transformers import pipeline, AutoModelForCausalLM, AutoTokenizer
-    from transformers.utils import logging
-    logging.set_verbosity_error()  # Reduce verbosity
+    from transformers.utils import logging as tf_logging
+    tf_logging.set_verbosity_error()  # Reduce verbosity
     TRANSFORMERS_AVAILABLE = True
 except ImportError:
-    print("Warning: transformers library not found. AI features will be disabled.")
+    logger.warning("transformers library not found. AI features will be disabled.")
     TRANSFORMERS_AVAILABLE = False
 
 class Agent:
     """
-    An AI agent that can communicate over the mesh network.
+    An AI agent that can communicate over BLE.
     
     Each agent has a unique ID and can send/receive messages,
     generating responses using a language model.
     """
     
-    def __init__(self, agent_id: str, mesh_network: Any, model_name: str = "distilgpt2"):
+    def __init__(self, agent_id: str, communicator: Any, model_name: str = "distilgpt2"):
         """
         Initialize a new agent.
         
         Args:
             agent_id: Unique identifier for this agent
-            mesh_network: Reference to the MeshNetwork instance
-            model_name: Name of the HuggingFace model to use
+            communicator: BLECommunicator instance for message transport
+            model_name: Name of the HuggingFace model to use (optional)
         """
         self.agent_id = agent_id
-        self.mesh = mesh_network
+        self.communicator = communicator
         self.model_name = model_name
         self.conversation_history: Dict[str, list] = {}
         self.model = None
         self.tokenizer = None
+        self.message_handler = None
         
         # Initialize the AI model
         self._init_model()
         
-        # Register with the mesh network
-        asyncio.create_task(
-            self.mesh.register_agent(agent_id, self._handle_message)
-        )
+        # Start the communicator with our message handler
+        asyncio.create_task(self.communicator.start(self._handle_message))
     
     def _init_model(self) -> None:
         """Initialize the language model and tokenizer."""
@@ -82,18 +87,21 @@ class Agent:
             sender: ID of the sending agent
             message: The message content
         """
-        print(f"[AGENT {self.agent_id}] Received from {sender}: {message.get('content', '')}")
+        logger.info(f"[AGENT {self.agent_id}] Received from {sender}: {message.get('content', '')}")
         
         # Update conversation history
         if sender not in self.conversation_history:
             self.conversation_history[sender] = []
         self.conversation_history[sender].append(("them", message.get('content', '')))
         
-        # Generate a response
-        response = await self._generate_response(sender, message.get('content', ''))
-        
-        # Send the response back
-        await self.send_message(sender, response)
+        # If we have a custom message handler, use it
+        if self.message_handler:
+            await self.message_handler(sender, message)
+        else:
+            # Default behavior: generate a response
+            response = await self._generate_response(sender, message.get('content', ''))
+            if response:
+                await self.send_message(sender, response)
     
     async def _generate_response(self, sender: str, message: str) -> str:
         """
@@ -173,20 +181,17 @@ class Agent:
             receiver: ID of the receiving agent
             content: The message content
         """
-        print(f"[AGENT {self.agent_id}] Sending to {receiver}: {content}")
+        logger.info(f"[AGENT {self.agent_id}] Sending to {receiver}: {content}")
         
         message = {
             "content": content,
-            "type": "chat",
-            "timestamp": asyncio.get_event_loop().time()
+            "type": "chat"
         }
         
-        print(f"[AGENT {self.agent_id}] Sending to {receiver}: {content}")
-        
         try:
-            await self.mesh.send(self.agent_id, receiver, message)
+            await self.communicator.send_message(receiver, message)
         except Exception as e:
-            print(f"[AGENT {self.agent_id}] Error sending message: {e}")
+            logger.error(f"[AGENT {self.agent_id}] Error sending message: {e}")
     
     async def start_conversation(self, receiver: str, content: str) -> None:
         """
@@ -196,8 +201,21 @@ class Agent:
             receiver: ID of the agent to start a conversation with
             content: The initial message content
         """
-        print(f"[AGENT {self.agent_id}] Starting conversation with {receiver}")
+        logger.info(f"[AGENT {self.agent_id}] Starting conversation with {receiver}")
         await self.send_message(receiver, content)
+    
+    async def close(self) -> None:
+        """Clean up resources used by the agent."""
+        await self.communicator.stop()
+    
+    def set_message_handler(self, handler: Callable[[str, Dict[str, Any]], None]) -> None:
+        """
+        Set a custom message handler function.
+        
+        Args:
+            handler: Function that takes (sender_id, message) and handles the message
+        """
+        self.message_handler = handler
     
     async def close(self) -> None:
         """Clean up resources and unregister from the network."""
